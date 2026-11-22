@@ -391,6 +391,37 @@ case_locks_in_the_way_are_handled() {
   wait 2>/dev/null
 }
 
+case_list_and_status_work_from_subfolders() {
+  local out t
+  "$PT" create sub-a --from "$P" --base head >/dev/null || fail "create failed"
+  t="$SANDBOX/proj.trees/sub-a"
+  mkdir -p "$t/BE/src" "$P/BE/deep"
+  for w in "$P" "$P/BE/deep" "$t" "$t/BE/src"; do
+    out=$(cd "$w" && "$PT" list --from .)
+    has_line "$out" "sub-a	$t	clean"
+  done
+  out=$(cd "$t/BE/src" && "$PT" status .) || fail "status from a tree subfolder failed"
+  has_line "$out" "unpublished 0"
+  (cd "$t/BE/src" && "$PT" remove .) >/dev/null 2>&1 && fail "remove resolved a subfolder upward"
+  check [ -f "$t/.project-tree" ]
+}
+
+case_status_and_remove_take_a_tree_name() {
+  local out
+  "$PT" create feature/login --from "$P" --base head >/dev/null || fail "create failed"
+  "$PT" create plain --from "$P" --base head >/dev/null || fail "create failed"
+  echo w >> "$SANDBOX/proj.trees/feature+login/FE/readme.md"
+  out=$(cd "$P" && "$PT" status feature/login) || fail "status by name failed"
+  has_line "$out" "modified	FE/readme.md"
+  out=$(cd "$P/BE" && "$PT" status feature/login) || fail "status by name from a repo failed"
+  has_line "$out" "modified	FE/readme.md"
+  (cd "$P" && "$PT" remove feature/login) >/dev/null 2>&1 && fail "remove by name of a tree holding work succeeded"
+  eq "$(cd "$P" && "$PT" remove plain)" removed
+  check [ ! -e "$SANDBOX/proj.trees/plain" ]
+  (cd "$P" && "$PT" status nope) >/dev/null 2>&1 && fail "status of an unknown name succeeded"
+  eq "$(cd "$P" && "$PT" remove "$SANDBOX/proj.trees/plain")" "already removed"
+}
+
 case_status_of_a_broken_tree_fails() {
   local t
   "$PT" create feat-a --from "$P" --base head >/dev/null || fail "create failed"

@@ -53,9 +53,13 @@ claude plugin install project-tree --marketplace Hyhen115/project-tree
 
 1. **Trust the folder once.** Run `claude` in `proj` and accept the trust
    prompt. Claude Code requires this before `-w` works there.
-2. **Start a feature:** `cd proj && claude -w feature-a`.
+2. **Start a feature:** `cd proj && claude -w feature-a`. Or, in a session
+   already open in `proj`, type `/project-tree:new feature-a`. Asking Claude
+   to "make a worktree called feature-a" works too.
 3. **Work as usual.** Commit in each repo, and push each repo on its own
-   (`git -C BE push -u origin feature-a`, or ask Claude to).
+   (`git -C BE push -u origin feature-a`, or ask Claude to). Merging is
+   ordinary git, per repo: each repo has its own `feature-a` branch to merge
+   or open a pull request for. The plugin's skill tells Claude this.
 4. **Leave with `/exit`.** If nothing changed, the tree is removed, along with
    each branch that got no commits. Otherwise Claude Code asks whether to keep
    or remove it. Removing never deletes commits: a branch with commits stays in
@@ -64,19 +68,34 @@ claude plugin install project-tree --marketplace Hyhen115/project-tree
 
 Subagents that Claude starts with worktree isolation in `proj` get project
 trees too. A tree an agent changed nothing in is removed when the agent ends.
-One it changed is kept for you to look at.
+One it changed is kept, on a branch like `agent-a1b2…` in each repo. Claude
+can bring that work into your tree: commit in the agent's tree, then merge or
+cherry-pick its branch in each repo. No push is needed.
 
-### Cleaning up
+### Commands
 
-Trees left behind, for example after `claude --resume` or `claude rm`, which
-keep them, can be listed and removed. Ask Claude ("list my project trees"),
-since `project-tree` is on the PATH of Claude's shell. Or run the commands
-yourself from the plugin's `bin/` folder:
+Type these in a Claude session in `proj` or in any of its trees. They are the
+project-wide counterparts of git's worktree commands:
+
+| Command | Does | Like |
+| --- | --- | --- |
+| `/project-tree:new <name>` | makes a tree and moves the session into it | `git worktree add` |
+| `/project-tree:list` | lists the project's trees: clean, committed, changed or unknown | `git worktree list` |
+| `/project-tree:status [name]` | what a tree holds, per repo (this tree if no name) | `git status` |
+| `/project-tree:remove <name>` | removes a tree; one that holds work only after you confirm | `git worktree remove` |
+
+`list` and `status` only read, and run without asking. `remove` asks first.
+Commits are never deleted: a branch with commits stays in its repo.
+
+Trees can be left behind, for example after `claude --resume` or `claude rm`,
+which keep them. `/project-tree:list` finds them. The commands run
+`bin/project-tree`, which also works from a shell:
 
 ```
-project-tree list --from proj          # name, path, clean | changed | committed | unknown
-project-tree remove proj.trees/feature-a          # refuses a tree that holds work
-project-tree remove proj.trees/feature-a --discard
+project-tree list --from proj
+project-tree status feature-a         # by name, run in proj or a tree
+project-tree remove feature-a         # refuses a tree that holds work
+project-tree remove feature-a --discard
 ```
 
 ## What's in a tree
@@ -139,6 +158,13 @@ project-tree remove proj.trees/feature-a --discard
     ignored files.
   - `remove` deletes a tree only once every worktree in it is removed, and
     keeps branches that have commits.
+- `skills/working-in-a-tree/SKILL.md` tells Claude what it can't see from inside a
+  tree:
+  - the top folder is not a repo, so it commits and pushes per repo;
+  - shared files are copies that don't merge back;
+  - how to bring a subagent's tree back.
+- `commands/` holds the `/project-tree:new`, `list`, `status` and `remove` commands.
+  `new` asks Claude to call EnterWorktree; the others run `bin/project-tree`.
 
 Tests:
 

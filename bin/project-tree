@@ -381,10 +381,44 @@ cmd_create() {
 
 # ---------------------------------------------------------------- status ----
 
-# The real path of a tree argument, checked against its manifest.
+# The nearest folder at or above $1 that holds a tree manifest, else the
+# nearest that has a <folder>.trees beside it: a tree or a project, from any
+# folder inside one. Prints nothing when there is none.
+find_up() {
+  local d
+  d=$(real_dir "$1") || return 0
+  while :; do
+    if [ -f "$d/$MANIFEST" ] || [ -d "$d.trees" ]; then
+      printf '%s\n' "$d"
+      return 0
+    fi
+    [ "$d" != / ] || return 0
+    d=$(dirname "$d")
+  done
+}
+
+# The trees folder of the project holding the current folder, or nothing.
+trees_here() {
+  local root
+  root=$(find_up .)
+  [ -n "$root" ] || return 0
+  [ -f "$root/$MANIFEST" ] && root=$(manifest_get "$root/$MANIFEST" root)
+  printf '%s.trees\n' "$root"
+}
+
+# The real path of a tree argument, checked against its manifest. The argument
+# is a tree's folder, or the name of one of this project's trees (feature/login
+# for <project>.trees/feature+login).
 open_tree() {
-  local t
-  t=$(real_dir "$1") || die "no such tree: $1"
+  local t trees
+  if [ ! -d "$1" ] && valid_name "$1"; then
+    trees=$(trees_here)
+    [ -n "$trees" ] && [ -d "$trees/${1//\//+}" ] ||
+      die "no such tree: $1 (not a folder, nor a tree of the project here; see: project-tree list)"
+    t=$(real_dir "$trees/${1//\//+}") || die "no such tree: $1"
+  else
+    t=$(real_dir "$1") || die "no such tree: $1"
+  fi
   [ -f "$t/$MANIFEST" ] || die "$1 is not a project tree (it has no $MANIFEST)"
   [ "$(manifest_get "$t/$MANIFEST" name | tr / +)" = "${t##*/}" ] || die "$1: its manifest names another tree"
   printf '%s\n' "$t"
@@ -392,8 +426,10 @@ open_tree() {
 
 cmd_status() {
   [ $# -eq 1 ] || usage
-  local tree manifest created sha rel head n pairs="" unpublished=0 repos name
-  tree=$(open_tree "$1") || exit 1
+  local tree manifest created sha rel head n pairs="" unpublished=0 repos name up
+  # A folder inside a tree (a repo, a subfolder) means that tree.
+  up=$(find_up "$1")
+  if [ -n "$up" ] && [ -f "$up/$MANIFEST" ]; then tree=$(open_tree "$up") || exit 1; else tree=$(open_tree "$1") || exit 1; fi
   manifest="$tree/$MANIFEST"
   name=$(manifest_get "$manifest" name)
   STATUS_TMP=$(mktemp -d) || die "could not make a temporary folder"
@@ -475,10 +511,15 @@ cmd_remove() {
     esac
   done
   [ -n "$arg" ] || usage
-  if [ ! -e "$arg" ]; then
-    printf 'already removed\n'
-    exit 0
-  fi
+  # A tree folder already gone was released. (A bare name is looked up below.)
+  case "$arg" in
+    /* | ./* | ../*)
+      if [ ! -e "$arg" ]; then
+        printf 'already removed\n'
+        exit 0
+      fi
+      ;;
+  esac
   tree=$(open_tree "$arg") || exit 1
   manifest="$tree/$MANIFEST"
   root=$(manifest_get "$manifest" root)
@@ -532,7 +573,10 @@ cmd_list() {
       *) usage ;;
     esac
   done
-  root=$(real_dir "$from") || die "no such folder: $from"
+  real_dir "$from" >/dev/null || die "no such folder: $from"
+  # From anywhere inside a project or a tree: walk up to it.
+  root=$(find_up "$from")
+  [ -n "$root" ] || root=$(real_dir "$from")
   [ -f "$root/$MANIFEST" ] && root=$(manifest_get "$root/$MANIFEST" root)
   report=$(mktemp) || die "could not make a temporary file"
   for t in "$(dirname "$root")/$(basename "$root").trees"/*; do
