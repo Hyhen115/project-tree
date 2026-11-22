@@ -1,0 +1,23 @@
+{
+  "name": "project-tree",
+  "version": "0.1.0",
+  "description": "Worktrees for a folder of git repos: one worktree per repo on the same branch, all made at once, so parallel sessions each get their own copy of the whole project.",
+  "author": {
+    "name": "Henry",
+    "url": "https://github.com/Hyhen115"
+  },
+  "homepage": "https://github.com/Hyhen115/project-tree",
+  "repository": "https://github.com/Hyhen115/project-tree",
+  "license": "MIT",
+  "keywords": ["worktree", "git", "multi-repo", "parallel"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Project Tree",
+    "shortDescription": "Worktrees across a folder of git repos",
+    "longDescription": "Start Codex in a project tree with `project-tree codex <name>`: every repo becomes a git worktree on that branch, and Codex can commit in each.",
+    "developerName": "Henry",
+    "category": "Developer Tools",
+    "capabilities": ["Instructions"],
+    "websiteURL": "https://github.com/Hyhen115/project-tree"
+  }
+}
