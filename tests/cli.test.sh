@@ -143,6 +143,9 @@ case_status_reports_commits() {
   st=$("$PT" status "$t") || fail "status failed"
   no_line "$st" "revision $since"
   has_line "$st" "unpublished 0"
+  has_line "$st" "committed 1 FE"
+  no_line "$st" "committed 1 BE"
+  has_line "$("$PT" list --from "$P")" "feat-a	$t	committed"
   (cd "$t/BE" && git checkout -q --detach && echo d >> readme.md && git commit -qam d && git checkout -q feat-a)
   st=$("$PT" status "$t") || fail "status failed"
   has_line "$st" "unpublished 0"
@@ -420,6 +423,46 @@ case_status_and_remove_take_a_tree_name() {
   check [ ! -e "$SANDBOX/proj.trees/plain" ]
   (cd "$P" && "$PT" status nope) >/dev/null 2>&1 && fail "status of an unknown name succeeded"
   eq "$(cd "$P" && "$PT" remove "$SANDBOX/proj.trees/plain")" "already removed"
+}
+
+case_codex_starts_in_the_tree_with_git_writable() {
+  local args t
+  mkdir -p "$SANDBOX/bin"
+  printf '#!/bin/sh\nprintf "cwd=%%s\\n" "$(pwd -P)" > "%s/argv"\nprintf "%%s\\n" "$@" >> "%s/argv"\n' "$SANDBOX" "$SANDBOX" > "$SANDBOX/bin/codex"
+  chmod +x "$SANDBOX/bin/codex"
+  git init -q "$P/EMPTY"
+  t="$SANDBOX/proj.trees/feat-c"
+
+  (cd "$P" && PATH="$SANDBOX/bin:$PATH" "$PT" codex feat-c -m o3) || fail "codex launcher failed"
+  args=$(cat "$SANDBOX/argv")
+  has_line "$args" "cwd=$t"
+  has_line "$args" "-C"
+  has_line "$args" "$t"
+  has_line "$args" "$SANDBOX/proj.trees"
+  for r in BE FE services/BFF; do has_line "$args" "$P/$r/.git"; done
+  no_line "$args" "$P/EMPTY/.git"
+  eq "$(printf '%s\n' "$args" | tail -2 | tr '\n' ' ')" "-m o3 " "codex's own arguments come last"
+  eq "$(printf '%s\n' "$args" | sed -n 2p)" "-C" "plain form starts with -C"
+
+  echo touched >> "$t/CLAUDE.md"
+  (cd "$P/BE" && PATH="$SANDBOX/bin:$PATH" "$PT" codex feat-c exec --skip-git-repo-check "do it") || fail "exec form failed"
+  args=$(cat "$SANDBOX/argv")
+  eq "$(printf '%s\n' "$args" | sed -n 2p)" "exec" "exec comes first"
+  has_line "$args" "do it"
+  eq "$(tail -1 "$t/CLAUDE.md")" touched "the tree is reused, not made again"
+
+  rm -f "$SANDBOX/argv"
+  git init -q "$SANDBOX/lone" && echo x > "$SANDBOX/lone/f" && git -C "$SANDBOX/lone" add -A && git -C "$SANDBOX/lone" commit -qm i
+  (cd "$SANDBOX/lone" && PATH="$SANDBOX/bin:$PATH" "$PT" codex solo) 2> "$SANDBOX/err" && fail "codex in a single repo succeeded"
+  grep -q 'codex --worktree' "$SANDBOX/err" || fail "no single-repo hint: $(cat "$SANDBOX/err")"
+  check [ ! -e "$SANDBOX/argv" ]
+  mkdir "$SANDBOX/plain"
+  (cd "$SANDBOX/plain" && PATH="$SANDBOX/bin:$PATH" "$PT" codex none) 2> "$SANDBOX/err" && fail "codex in a folder with no repos succeeded"
+  grep -q 'not a folder of git repos' "$SANDBOX/err" || fail "no clear message: $(cat "$SANDBOX/err")"
+  (cd "$P" && PATH="$SANDBOX/bin:$PATH" "$PT" codex exec) >/dev/null 2>&1 && fail "accepted 'exec' as a tree name"
+  check [ ! -e "$SANDBOX/proj.trees/exec" ]
+  (cd "$P" && PATH=/usr/bin:/bin "$PT" codex feat-c) 2> "$SANDBOX/err" && fail "succeeded with no codex on PATH"
+  grep -q 'codex is not on PATH' "$SANDBOX/err" || fail "no clear message: $(cat "$SANDBOX/err")"
 }
 
 case_status_of_a_broken_tree_fails() {

@@ -1,6 +1,6 @@
 ---
 name: working-in-a-tree
-description: This skill should be used when working inside a project tree (a folder under <project>.trees/ that holds several git repos, made by `claude -w` or `/project-tree:new` with the project-tree plugin), or when committing, pushing, opening pull requests, merging, or bringing back a subagent's worktree across several repos.
+description: This skill should be used when working inside a project tree (a folder under <project>.trees/ that holds several git repos, made by `claude -w`, `/project-tree:new` or `project-tree codex` with the project-tree plugin), or when committing, pushing, opening pull requests, merging, or bringing back a subagent's worktree across several repos.
 ---
 
 # Working in a project tree
@@ -17,4 +17,7 @@ A project tree is a copy of a folder of git repos. Its top folder holds a `.proj
   3. Run `project-tree remove <agent-branch> --discard`.
   4. Delete the agent's branch from this tree. After a merge, use `git -C BE branch -d <agent-branch>`; run from the original repo it says "not fully merged". A cherry-pick gives the commits new ids, so `-d` refuses: check they all landed (`git -C BE log --oneline -n <count>`), then use `-D`.
 - **Agent trees sit outside this session's folder**, so Claude Code may ask before touching them. `/add-dir <project>.trees` allows them all.
+- **In Codex:**
+  - `project-tree` is not on PATH unless the user linked it. If `command -v project-tree` prints nothing, tell them to link it (the plugin's README shows how) and stop there.
+  - A git command failing with "Operation not permitted" on a `.git/...lock` file means the session wasn't started with `project-tree codex <name>`. That launcher makes each repo's git folder writable, so tell the user to restart Codex with it.
 - **Never** run git at the top folder, or `git worktree remove` or `rm -rf` on a tree. `project-tree remove <tree>` takes a tree away, and refuses one that holds work unless given `--discard`.

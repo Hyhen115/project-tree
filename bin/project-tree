@@ -5,6 +5,7 @@
 #   project-tree status <tree>
 #   project-tree remove <tree> [--discard]
 #   project-tree list [--from <dir>]
+#   project-tree codex <name> [--base head|fresh] [codex arguments...]
 #
 # A project tree mirrors a folder (not itself a git repo) that holds git repos:
 # each repo becomes a git worktree on branch <name>, every other file is copied
@@ -12,7 +13,8 @@
 #
 # create prints the tree's path and its revision, one per line; exit 3 means
 # the folder is not one project-tree handles (a git repo, or no repos inside).
-# status prints "revision <id>", "unpublished <n>", then "<state>\t<path>" per
+# status prints "revision <id>", "unpublished <n>", a "committed <n> <repo>"
+# line per repo with new commits, then "<state>\t<path>" per uncommitted
 # change. Messages go to stderr; stdout carries only these lines.
 set -Eeuo pipefail
 shopt -s dotglob nullglob
@@ -35,7 +37,7 @@ NEWLINE=${NEWLINE%x}
 die() { printf 'project-tree: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'project-tree: %s\n' "$*" >&2; }
 gitq() { git -c core.quotePath=false --no-optional-locks "$@"; }
-usage() { sed -n '4,7p' "$SELF" | sed 's/^#   /usage: /' >&2; exit 2; }
+usage() { sed -n '4,8p' "$SELF" | sed 's/^#   /usage: /' >&2; exit 2; }
 
 # The real absolute path of an existing folder.
 real_dir() { (cd "$1" 2>/dev/null && pwd -P); }
@@ -441,6 +443,9 @@ cmd_status() {
     pairs="$pairs$rel:$head,"
     n=$(git -C "$tree/$rel" rev-list --count HEAD --not --branches --tags --remotes) || die "$rel: cannot count commits"
     unpublished=$((unpublished + n))
+    # Commits made since the tree was made: shown per repo, not counted as changes.
+    n=$(git -C "$tree/$rel" rev-list --count "$sha..HEAD" 2>/dev/null || echo 0)
+    [ "$n" = 0 ] || printf 'committed %s %s\n' "$n" "$rel" >> "$STATUS_TMP/commits"
     # A stash made in the tree is work its files no longer show; it lives in
     # the repo's shared stash list, so the tree is kept and says where.
     [ "$(stash_count "$tree/$rel" "$name")" = "$(stash_at_create "$manifest" "$rel")" ] ||
@@ -484,6 +489,7 @@ cmd_status() {
 
   printf 'revision %s\n' "$(fingerprint "$pairs")"
   printf 'unpublished %s\n' "$unpublished"
+  [ ! -f "$STATUS_TMP/commits" ] || cat "$STATUS_TMP/commits"
   LC_ALL=C sort -u "$STATUS_TMP/changes"
 }
 
@@ -497,6 +503,7 @@ report_state() {
   awk -v since="$2" '
     $1 == "revision" { moved = ($2 != since); next }
     $1 == "unpublished" { if ($2 != "0") changed = 1; next }
+    $1 == "committed" { moved = 1; next }
     NF > 0 { changed = 1 }
     END { print changed ? "changed" : moved ? "committed" : "clean" }' "$1"
 }
@@ -591,10 +598,50 @@ cmd_list() {
   rm -f "$report"
 }
 
+# ----------------------------------------------------------------- codex ----
+
+# Make or reuse tree <name>, then start Codex in it. Codex's own --worktree
+# makes one git worktree and has no hook to take over, so this is how a Codex
+# session gets a project tree. Its sandbox writes only to the session's folder
+# (and temp), but a commit in a tree writes to each repo's real .git, outside
+# it: those folders, and the trees folder, are made writable with --add-dir.
+cmd_codex() {
+  local name=${1:-} base=head from out rc=0 tree trees created sha rel gitdir sub="" dirs=()
+  case "$name" in
+    "" | -*) usage ;;
+    exec | e | resume | review | fork) die "'$name' is a codex command, not a tree name: project-tree codex <name> $name ..." ;;
+  esac
+  shift
+  if [ "${1:-}" = --base ]; then
+    [ $# -ge 2 ] || usage
+    base=$2
+    shift 2
+  fi
+  command -v codex >/dev/null 2>&1 || die "codex is not on PATH"
+  from=$(find_up .)
+  [ -n "$from" ] || from=.
+  out=$("$SELF" create "$name" --from "$from" --base "$base") || rc=$?
+  [ $rc -ne 3 ] || die "$(real_dir "$from") is not a folder of git repos (run this in the folder that holds them; in a single repo, use codex --worktree)"
+  [ $rc -eq 0 ] || exit "$rc"
+  tree=$(printf '%s\n' "$out" | sed -n 1p)
+  trees=$(dirname "$tree")
+  dirs=(--add-dir "$trees")
+  while read -r created sha rel; do
+    gitdir=$(git -C "$tree/$rel" rev-parse --git-common-dir) || die "$rel: cannot find its git folder"
+    case "$gitdir" in /*) ;; *) gitdir="$tree/$rel/$gitdir" ;; esac
+    dirs+=(--add-dir "$(real_dir "$gitdir")")
+  done < <(manifest_repos "$tree/$MANIFEST")
+  # Codex's subcommands take -C and --add-dir themselves: put those after one.
+  case "${1:-}" in exec | e | resume | review | fork) sub=$1; shift ;; esac
+  cd "$tree" || die "could not enter $tree"
+  exec codex ${sub:+"$sub"} -C "$tree" "${dirs[@]}" "$@"
+}
+
 case "${1:-}" in
   create) shift; cmd_create "$@" ;;
   status) shift; cmd_status "$@" ;;
   remove) shift; cmd_remove "$@" ;;
   list) shift; cmd_list "$@" ;;
+  codex) shift; cmd_codex "$@" ;;
   *) usage ;;
 esac

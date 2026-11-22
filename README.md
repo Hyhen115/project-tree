@@ -32,6 +32,9 @@ touching each other or `proj`.
 Inside one git repo nothing changes: `claude -w` still makes Claude Code's own
 worktree there.
 
+It works with Codex too: `project-tree codex feature-a` makes the tree and
+starts Codex in it. See [Codex](#codex).
+
 ## Install
 
 Requires Claude Code 2.1.330 or newer, git, and bash. It is built for macOS and
@@ -97,6 +100,51 @@ project-tree status feature-a         # by name, run in proj or a tree
 project-tree remove feature-a         # refuses a tree that holds work
 project-tree remove feature-a --discard
 ```
+
+To run `project-tree` in your own terminal, link it into a folder on your PATH
+once. `~/.local/bin` is where Claude Code installs `claude`:
+
+```
+ln -s ~/path/to/project-tree/bin/project-tree ~/.local/bin/project-tree
+```
+
+## Codex
+
+Requires the Codex CLI, git and bash.
+
+1. **Install the plugin.** It brings the skill and the commands:
+
+   ```
+   codex plugin marketplace add Hyhen115/project-tree
+   codex plugin add project-tree@project-tree
+   ```
+
+   Codex installs a copy. After you update the plugin, run
+   `codex plugin marketplace upgrade` and add it again.
+2. **Link the CLI**, as above. Codex doesn't put a plugin's `bin/` on its PATH,
+   and both the launcher and the skill need `project-tree`.
+3. **Start a feature:** in `proj`, run `project-tree codex feature-a`. It makes
+   the tree, or reuses it, and starts Codex inside it. Anything after the name
+   goes to Codex: `project-tree codex feature-a -m o3`, or
+   `project-tree codex feature-a exec "add a health check"`.
+
+The launcher matters because of Codex's sandbox. A Codex session may write only
+to its own folder, and a commit in a tree writes to each repo's real `.git`, in
+`proj`. Without the launcher, git in a tree fails with "Operation not
+permitted". The launcher marks those folders, and the trees folder, as writable
+(`--add-dir`).
+
+Codex's own `codex --worktree` still makes a single-repo worktree. A plugin
+can't take it over, which is why there's a separate launcher.
+
+New trees start from what each repo has checked out (`--base head`). Use
+`project-tree codex feature-a --base fresh` to start from origin's latest
+default branch instead. The base only matters when the tree is first made.
+
+**Different from Claude Code:**
+- Leaving Codex doesn't remove the tree. Run `project-tree remove <name>` when
+  you're done; it refuses a tree that holds work.
+- Codex's subagents don't get project trees.
 
 ## What's in a tree
 
@@ -165,6 +213,10 @@ project-tree remove feature-a --discard
   - how to bring a subagent's tree back.
 - `commands/` holds the `/project-tree:new`, `list`, `status` and `remove` commands.
   `new` asks Claude to call EnterWorktree; the others run `bin/project-tree`.
+- For Codex:
+  - `.codex-plugin/plugin.json` describes the plugin. Codex reads the same
+    `skills/` and `commands/`, turning the commands into skills.
+  - `project-tree codex` is the launcher.
 
 Tests:
 

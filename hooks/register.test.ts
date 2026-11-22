@@ -36,7 +36,7 @@ test('a create that fails is denied with its reason', async ($, on) => {
 
 test('status lines become the changes the exit dialog reads', async ($, on) => {
   on('process.run', () =>
-    ran(0, 'revision def456\nunpublished 2\nmodified\tBE/a.ts\nuntracked\tFE/new file.ts\nadded\tCLAUDE.md\n'))
+    ran(0, 'revision def456\nunpublished 2\ncommitted 3 BE\nmodified\tBE/a.ts\nuntracked\tFE/new file.ts\nadded\tCLAUDE.md\n'))
 
   expect(await $.vcs.status({ path: TREE, name: 'feat-a', vcs: 'project-tree', since: 'abc123' })).toEqual({
     revision: 'def456',
