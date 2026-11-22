@@ -1,0 +1,16 @@
+{
+  "name": "project-tree",
+  "description": "project-tree: Claude Code worktrees for a folder of several git repos.",
+  "owner": {
+    "name": "Henry",
+    "url": "https://github.com/Hyhen115"
+  },
+  "plugins": [
+    {
+      "name": "project-tree",
+      "source": "./",
+      "description": "claude -w for a folder of git repos: one worktree per repo on the same branch, all made at once.",
+      "category": "productivity"
+    }
+  ]
+}

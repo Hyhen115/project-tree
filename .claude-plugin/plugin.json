@@ -1,0 +1,16 @@
+{
+  "name": "project-tree",
+  "version": "0.1.0",
+  "description": "claude -w for a folder of git repos: one worktree per repo on the same branch, all made at once, so parallel sessions each get their own copy of the whole project.",
+  "author": {
+    "name": "Henry",
+    "url": "https://github.com/Hyhen115"
+  },
+  "homepage": "https://github.com/Hyhen115/project-tree",
+  "repository": "https://github.com/Hyhen115/project-tree",
+  "license": "MIT",
+  "keywords": ["worktree", "git", "multi-repo", "parallel"],
+  "engines": {
+    "claude-code": ">=2.1.330"
+  }
+}

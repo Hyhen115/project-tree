@@ -1,0 +1,556 @@
+#!/usr/bin/env bash
+# project-tree: git worktrees for a folder of git repos.
+#
+#   project-tree create <name> [--from <dir>] [--base fresh|head]
+#   project-tree status <tree>
+#   project-tree remove <tree> [--discard]
+#   project-tree list [--from <dir>]
+#
+# A project tree mirrors a folder (not itself a git repo) that holds git repos:
+# each repo becomes a git worktree on branch <name>, every other file is copied
+# in. Trees live beside the folder, in <folder>.trees/<name with / as +>.
+#
+# create prints the tree's path and its revision, one per line; exit 3 means
+# the folder is not one project-tree handles (a git repo, or no repos inside).
+# status prints "revision <id>", "unpublished <n>", then "<state>\t<path>" per
+# change. Messages go to stderr; stdout carries only these lines.
+set -Eeuo pipefail
+shopt -s dotglob nullglob
+
+# This script, absolute: remove and list run `status` through it after a `cd`.
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+
+MANIFEST=.project-tree
+JOURNAL=.project-tree.journal
+TMP_MANIFEST=.project-tree.tmp
+# Ignored files that tools rebuild: not reported as work, not hashed.
+REBUILT_RE='(^|/)(node_modules|dist|build|out|target|coverage|vendor|__pycache__|\.venv|venv|\.next|\.nuxt|\.turbo|\.gradle|\.cache|\.parcel-cache|\.pytest_cache|\.mypy_cache|\.idea|\.DS_Store)(/|$)'
+# Copied files whose changes are not work: OS litter, Claude's per-machine files.
+NOISE_RE='(^|/)\.DS_Store$|^\.claude/settings\.local\.json$|^\.claude/(projects|worktrees|todos|shell-snapshots)(/|$)'
+
+TAB=$(printf '\t')
+NEWLINE=$(printf '\nx')
+NEWLINE=${NEWLINE%x}
+
+die() { printf 'project-tree: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'project-tree: %s\n' "$*" >&2; }
+gitq() { git -c core.quotePath=false --no-optional-locks "$@"; }
+usage() { sed -n '4,7p' "$SELF" | sed 's/^#   /usage: /' >&2; exit 2; }
+
+# The real absolute path of an existing folder.
+real_dir() { (cd "$1" 2>/dev/null && pwd -P); }
+
+# Parts of [A-Za-z0-9._-] joined by "/", at most 64 characters, a valid branch.
+valid_name() {
+  [ ${#1} -le 64 ] &&
+    printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$' &&
+    git check-ref-format --branch "$1" >/dev/null 2>&1
+}
+
+# Value of a "key value" line in a manifest.
+manifest_get() { awk -v k="$2" '$1 == k { sub(/^[^ ]+ /, ""); print; exit }' "$1"; }
+
+# Repo lines of a manifest: "<created> <sha> <rel>".
+manifest_repos() { awk '$1 == "repo" { sub(/^repo /, ""); print }' "$1"; }
+
+# How many stashes repo $1 holds that were made on branch $2. Stashes live in
+# the repo's shared refs/stash; git names the branch each was made on.
+stash_count() {
+  git -C "$1" stash list --format='%gs' 2>/dev/null |
+    awk -v b="$2" 'index($0, "WIP on " b ": ") == 1 || index($0, "On " b ": ") == 1 { n++ } END { print n + 0 }'
+}
+
+# The stash count of repo $2 recorded in manifest $1 when the tree was made.
+stash_at_create() { awk -v r="$2" '$1 == "stash" { n = $2; sub(/^stash [^ ]+ /, ""); if ($0 == r) { print n; exit } }' "$1"; }
+
+# The only recursive delete: a folder directly inside a *.trees folder.
+safe_rm() {
+  case "$1" in /*) ;; *) die "refusing to delete a relative path: $1" ;; esac
+  case "/$1/" in */../* | */./*) die "refusing to delete a path with . or .. parts: $1" ;; esac
+  case "$(dirname "$1")" in *.trees) ;; *) die "refusing to delete $1: it is not inside a .trees folder" ;; esac
+  rm -rf -- "$1"
+}
+
+# Copy a file, link or folder to a path that does not exist yet.
+copy_entry() {
+  if [ "$(uname)" = Darwin ]; then cp -cRP "$1" "$2"; else cp -RP --reflink=auto "$1" "$2"; fi
+}
+
+# The outermost folders under $1 that hold .git, as sorted relative paths.
+find_repos() {
+  local list rel k inside kept=()
+  list=$(cd "$1" && find . -mindepth 2 -maxdepth 5 \
+    \( -name node_modules -o -name '*.trees' -o -name .claude \) -prune -o \
+    -name .git -print) || return 1
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    inside=0
+    for k in ${kept[@]+"${kept[@]}"}; do
+      case "$rel/" in "$k"/*) inside=1 ;; esac
+    done
+    [ $inside -eq 1 ] || kept+=("$rel")
+  done < <(printf '%s\n' "$list" | sed -n 's|^\./||; s|/\.git$||p' | LC_ALL=C sort)
+  for k in ${kept[@]+"${kept[@]}"}; do printf '%s\n' "$k"; done
+}
+
+# A short id for a list of "rel:sha," pairs.
+fingerprint() { printf '%s' "$1" | git hash-object --stdin; }
+
+# Files, links and empty folders under tree $1 that are not inside its repos
+# ($2: repo rels, one per line), plus the authored ignored files inside each
+# repo, as sorted relative paths: what `git status` does not show and a removal
+# would lose. Fails on a name holding a tab or a newline, which these
+# line-based lists cannot carry: a tree that cannot be read is never "clean".
+tracked_extras() {
+  local base=$1 repos=$2 prune=() r odd
+  while IFS= read -r r; do
+    [ -n "$r" ] && prune+=(-path "./$r" -o)
+  done <<< "$repos"
+  odd=$(cd "$base" && find . -mindepth 1 \
+    \( ${prune[@]+"${prune[@]}"} -name node_modules -o -name '*.trees' \) -prune -o \
+    \( -name "*$TAB*" -o -name "*$NEWLINE*" \) -print) || return 1
+  [ -z "$odd" ] || { warn "a file name outside the repos holds a tab or a newline: ${odd%%"$NEWLINE"*}"; return 1; }
+  {
+    (cd "$base" && find . -mindepth 1 \
+      \( ${prune[@]+"${prune[@]}"} -name node_modules -o -name '*.trees' \) -prune -o \
+      \( -type f -o -type l -o -type d -empty \) -print) || return 1
+    while IFS= read -r r; do
+      [ -n "$r" ] && [ -d "$base/$r" ] || continue
+      gitq -C "$base/$r" ls-files -z --others --ignored --exclude-standard | tr '\0' '\n' |
+        awk -v re="$REBUILT_RE" -v rel="$r" '$0 != "" && $0 !~ re { print "./" rel "/" $0 }' || return 1
+    done <<< "$repos"
+  } | awk -v m="./$MANIFEST" -v j="./$JOURNAL" -v t="./$TMP_MANIFEST" \
+    '$0 != m && $0 != j && $0 != t { print substr($0, 3) }' | LC_ALL=C sort -u
+}
+
+# "<hash>\t<path>" for each path on stdin (relative to $1). Files are hashed
+# in one git call, F or X (executable) ahead of the hash; links (L) by their
+# target text; empty folders are D.
+hash_paths() {
+  local base=$1 p files kinds links
+  files=$(mktemp) && kinds=$(mktemp) && links=$(mktemp) || return 1
+  while IFS= read -r p; do
+    if [ -L "$base/$p" ]; then
+      printf '%s\n' "$p" >> "$links"
+    elif [ -f "$base/$p" ]; then
+      printf '%s\n' "$p" >> "$files"
+      if [ -x "$base/$p" ]; then echo X; else echo F; fi >> "$kinds"
+    elif [ -d "$base/$p" ]; then
+      printf 'D\t%s\n' "$p"
+    fi
+  done
+  if [ -s "$files" ]; then
+    (cd "$base" && git hash-object --no-filters --stdin-paths < "$files") |
+      awk -v kinds="$kinds" -v names="$files" '{ getline k < kinds; getline n < names; print k $0 "\t" n }'
+  fi
+  while IFS= read -r p; do
+    printf 'L%s\t%s\n' "$(readlink "$base/$p" | git hash-object --stdin)" "$p"
+  done < "$links"
+  rm -f "$files" "$kinds" "$links"
+}
+
+# ---------------------------------------------------------------- create ----
+
+CLEANUP_TREE=""
+LOCK_DIR=""
+
+# Undo what a journal records: every worktree first (git keeps a branch that
+# a worktree has checked out), then every branch this create made. A "new"
+# line is written before `git worktree add -b`; a create killed inside that
+# add leaves the branch made but not journaled, so such a branch is deleted
+# too when it still points at the recorded start and no worktree has it.
+rollback() {
+  local journal=$1 kind repo arg sha cur
+  [ -f "$journal" ] || return 0
+  while IFS=$'\t' read -r kind repo arg sha; do
+    case "$kind" in worktree | new) ;; *) continue ;; esac
+    git -C "$repo" worktree remove --force "$arg" >/dev/null 2>&1 || true
+    git -C "$repo" worktree prune >/dev/null 2>&1 || true
+  done < "$journal"
+  while IFS=$'\t' read -r kind repo arg sha; do
+    case "$kind" in
+      branch) git -C "$repo" branch -D "$arg" >/dev/null 2>&1 || true ;;
+      new)
+        grep -qxF "branch	$repo	$NAME" "$journal" && continue
+        cur=$(git -C "$repo" rev-parse --verify -q "refs/heads/$NAME") || continue
+        [ "$cur" = "$sha" ] || continue
+        case "$NEWLINE$(git -C "$repo" worktree list --porcelain)$NEWLINE" in
+          *"${NEWLINE}branch refs/heads/$NAME$NEWLINE"*) continue ;;
+        esac
+        git -C "$repo" branch -D "$NAME" >/dev/null 2>&1 || true
+        ;;
+    esac
+  done < "$journal"
+}
+
+on_exit() {
+  local code=$?
+  trap - EXIT
+  if [ -n "$CLEANUP_TREE" ]; then
+    warn "create failed; undoing it"
+    rollback "$CLEANUP_TREE/$JOURNAL"
+    safe_rm "$CLEANUP_TREE"
+  fi
+  [ -z "$LOCK_DIR" ] || { rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null; } || true
+  exit "$code"
+}
+
+# Mirror folder $1 (relative to FROM, "" for the top) into TREE.
+mirror() {
+  local rel=$1 p name child r kind
+  for p in "$FROM${rel:+/$rel}"/*; do
+    name=${p##*/}
+    child=${rel:+$rel/}$name
+    case "$name" in "$MANIFEST" | "$JOURNAL" | "$TMP_MANIFEST") continue ;; esac
+    kind=copy
+    while IFS= read -r r; do
+      if [ "$r" = "$child" ]; then
+        kind=repo
+      else
+        case "$r" in "$child"/*) kind=holder ;; esac
+      fi
+    done <<< "$REPOS"
+    [ $kind = holder ] && { [ ! -d "$p" ] || [ -L "$p" ]; } && kind=copy
+    case $kind in
+      repo) add_worktree "$child" ;;
+      holder) mkdir "$TREE/$child" || die "could not make $TREE/$child"; mirror "$child" ;;
+      copy) copy_entry "$p" "$TREE/$child" || die "could not copy $child" ;;
+    esac
+  done
+}
+
+# The commit a repo's new branch starts from, as a SHA.
+start_commit() {
+  local repo=$1 rel=$2 ref
+  if [ "$BASE" = fresh ] && git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+    # Never prompt, and give up on a stalled server: ssh after 10 s to
+    # connect, http after 20 s below 1 KB/s.
+    GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=10}" \
+      git -C "$repo" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch --quiet origin </dev/null >&2 ||
+      warn "$rel: could not fetch origin; starting from what was fetched before"
+    for ref in refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master; do
+      git -C "$repo" rev-parse --verify -q "$ref^{commit}" && return 0
+    done
+    warn "$rel: origin has no default branch here; starting from its current HEAD"
+  fi
+  git -C "$repo" rev-parse --verify -q 'HEAD^{commit}'
+}
+
+add_worktree() {
+  local rel=$1 repo dest sha created=1
+  repo="$FROM/$rel"
+  dest="$TREE/$rel"
+  if ! git -C "$repo" rev-parse --verify -q 'HEAD^{commit}' >/dev/null; then
+    warn "$rel has no commits yet; copying it as plain files"
+    copy_entry "$repo" "$dest" || die "could not copy $rel"
+    return 0
+  fi
+  git -C "$repo" worktree prune >/dev/null 2>&1 || true
+  if git -C "$repo" show-ref --verify -q "refs/heads/$NAME"; then
+    created=0
+    sha=$(git -C "$repo" rev-parse "refs/heads/$NAME") || die "$rel: cannot read branch $NAME"
+    printf 'worktree\t%s\t%s\n' "$repo" "$dest" >> "$TREE/$JOURNAL"
+    git -C "$repo" worktree add --quiet "$dest" "$NAME" >&2 ||
+      die "$rel: could not check out branch $NAME; if it is checked out elsewhere, see: git -C '$repo' worktree list"
+  else
+    sha=$(start_commit "$repo" "$rel") || die "$rel: no commit to start from"
+    printf 'new\t%s\t%s\t%s\n' "$repo" "$dest" "$sha" >> "$TREE/$JOURNAL"
+    if ! git -C "$repo" worktree add --quiet -b "$NAME" "$dest" "$sha" >&2; then
+      # A failing post-checkout hook fails the add after the worktree is made.
+      case "$NEWLINE$(git -C "$repo" worktree list --porcelain)$NEWLINE" in
+        *"${NEWLINE}worktree $dest$NEWLINE"*) ;;
+        *) die "$rel: git worktree add failed" ;;
+      esac
+      warn "$rel: a git hook failed after checkout; the worktree was made"
+    fi
+    # Journaled only once made, so a rollback never deletes a branch it did not make.
+    printf 'branch\t%s\t%s\n' "$repo" "$NAME" >> "$TREE/$JOURNAL"
+  fi
+  copy_included "$rel"
+  printf 'repo %s %s %s\n' "$created" "$sha" "$rel" >> "$TREE/$TMP_MANIFEST"
+  printf 'stash %s %s\n' "$(stash_count "$repo" "$NAME")" "$rel" >> "$TREE/$TMP_MANIFEST"
+}
+
+# Copy the ignored files a repo's .worktreeinclude names, as Claude Code does.
+copy_included() {
+  local rel=$1 repo p
+  repo="$FROM/$rel"
+  [ -f "$repo/.worktreeinclude" ] || return 0
+  gitq -C "$repo" ls-files -z --others --ignored --exclude-standard --directory | tr '\0' '\n' |
+    while IFS= read -r p; do
+      p=${p%/}
+      [ -n "$p" ] && [ ! -e "$TREE/$rel/$p" ] || continue
+      [ -n "$(gitq -C "$repo" ls-files -z --others --ignored --directory --exclude-from=.worktreeinclude -- "$p" | tr -d '\0')" ] ||
+        continue
+      mkdir -p "$(dirname "$TREE/$rel/$p")"
+      copy_entry "$repo/$p" "$TREE/$rel/$p" || warn "$rel: could not copy $p"
+    done
+}
+
+# If $1 is the finished tree of NAME from ROOT, print "<path>\n<since>".
+existing_tree() {
+  local m="$1/$MANIFEST"
+  [ -f "$m" ] || return 1
+  [ "$(manifest_get "$m" name)" = "$NAME" ] ||
+    die "$1 holds the tree '$(manifest_get "$m" name)', not '$NAME' (names differing only in case share a folder)"
+  [ "$(manifest_get "$m" root)" = "$ROOT" ] || die "$1 was made from $(manifest_get "$m" root), not $ROOT"
+  printf '%s\n%s\n' "$1" "$(manifest_get "$m" since)"
+}
+
+cmd_create() {
+  local from=. trees tree rel created sha pairs="" revision repos waited=0 owner
+  NAME=""
+  BASE=fresh
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from) [ $# -ge 2 ] || usage; from=$2; shift 2 ;;
+      --base) [ $# -ge 2 ] || usage; BASE=$2; shift 2 ;;
+      -*) usage ;;
+      *) [ -z "$NAME" ] || usage; NAME=$1; shift ;;
+    esac
+  done
+  [ -n "$NAME" ] || usage
+  case "$BASE" in fresh | head) ;; *) die "--base must be fresh or head" ;; esac
+  valid_name "$NAME" || die "invalid name '$NAME': use letters, digits and . _ - in parts joined by /, at most 64 characters"
+
+  FROM=$(real_dir "$from") || die "no such folder: $from"
+  git -C "$FROM" rev-parse --is-inside-work-tree >/dev/null 2>&1 && exit 3
+  REPOS=$(find_repos "$FROM") || die "could not search $FROM for repos"
+  [ -n "$REPOS" ] || exit 3
+
+  # A tree made from a tree sits beside it, not inside it.
+  ROOT=$FROM
+  [ -f "$FROM/$MANIFEST" ] && ROOT=$(manifest_get "$FROM/$MANIFEST" root)
+  trees="$(dirname "$ROOT")/$(basename "$ROOT").trees"
+  tree="$trees/${NAME//\//+}"
+  existing_tree "$tree" && exit 0
+
+  mkdir -p "$trees" || die "could not make $trees"
+  trees=$(real_dir "$trees") || die "could not open $trees"
+  TREE="$trees/${NAME//\//+}"
+  trap on_exit EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+  until mkdir "$TREE.lock" 2>/dev/null; do
+    [ -d "$TREE.lock" ] || [ ! -e "$TREE.lock" ] || die "$TREE.lock is in the way (not a folder); move it away and retry"
+    # A lock whose owner is gone (killed, crashed) is taken over; so is one
+    # with no owner written after 10 s (killed between mkdir and the write).
+    # `ps -p` sees another user's process, which `kill -0` cannot signal.
+    owner=$(cat "$TREE.lock/pid" 2>/dev/null || true)
+    if { [ -n "$owner" ] && ! ps -p "$owner" >/dev/null 2>&1; } ||
+      { [ -z "$owner" ] && [ $waited -ge 100 ]; }; then
+      warn "taking over the lock of an earlier create that did not finish"
+      rm -f "$TREE.lock/pid"
+      rmdir "$TREE.lock" 2>/dev/null || true
+      continue
+    fi
+    [ $waited -lt 600 ] || die "another project-tree has been making $TREE for a minute; if none is running, remove $TREE.lock"
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  LOCK_DIR="$TREE.lock"
+  printf '%s\n' "$$" > "$LOCK_DIR/pid"
+  existing_tree "$TREE" && exit 0
+  if [ -e "$TREE" ]; then
+    [ -f "$TREE/$JOURNAL" ] || die "$TREE exists but is not a project tree; move it away and retry"
+    warn "cleaning up an earlier create of $NAME that did not finish"
+    rollback "$TREE/$JOURNAL"
+    safe_rm "$TREE"
+  fi
+
+  mkdir "$TREE" || die "could not make $TREE"
+  CLEANUP_TREE=$TREE
+  : > "$TREE/$JOURNAL"
+  printf 'root %s\nname %s\n' "$ROOT" "$NAME" > "$TREE/$TMP_MANIFEST"
+  mirror ""
+
+  while read -r created sha rel; do
+    pairs="$pairs$rel:$sha,"
+  done < <(manifest_repos "$TREE/$TMP_MANIFEST")
+  revision=$(fingerprint "$pairs") || die "could not compute the revision"
+  repos=$(manifest_repos "$TREE/$TMP_MANIFEST" | cut -d' ' -f3-)
+  {
+    printf 'since %s\n' "$revision"
+    tracked_extras "$TREE" "$repos" | hash_paths "$TREE" | sed 's/^/file /'
+  } >> "$TREE/$TMP_MANIFEST" || die "could not record the copied files"
+  mv "$TREE/$TMP_MANIFEST" "$TREE/$MANIFEST" || die "could not write the manifest"
+  rm -f "$TREE/$JOURNAL"
+  CLEANUP_TREE=""
+  printf '%s\n%s\n' "$TREE" "$revision"
+}
+
+# ---------------------------------------------------------------- status ----
+
+# The real path of a tree argument, checked against its manifest.
+open_tree() {
+  local t
+  t=$(real_dir "$1") || die "no such tree: $1"
+  [ -f "$t/$MANIFEST" ] || die "$1 is not a project tree (it has no $MANIFEST)"
+  [ "$(manifest_get "$t/$MANIFEST" name | tr / +)" = "${t##*/}" ] || die "$1: its manifest names another tree"
+  printf '%s\n' "$t"
+}
+
+cmd_status() {
+  [ $# -eq 1 ] || usage
+  local tree manifest created sha rel head n pairs="" unpublished=0 repos name
+  tree=$(open_tree "$1") || exit 1
+  manifest="$tree/$MANIFEST"
+  name=$(manifest_get "$manifest" name)
+  STATUS_TMP=$(mktemp -d) || die "could not make a temporary folder"
+  trap 'rm -rf "$STATUS_TMP"' EXIT
+
+  while read -r created sha rel; do
+    [ -d "$tree/$rel" ] || die "$rel is missing from the tree"
+    head=$(git -C "$tree/$rel" rev-parse --verify -q HEAD) || die "$rel: cannot read HEAD"
+    pairs="$pairs$rel:$head,"
+    n=$(git -C "$tree/$rel" rev-list --count HEAD --not --branches --tags --remotes) || die "$rel: cannot count commits"
+    unpublished=$((unpublished + n))
+    # A stash made in the tree is work its files no longer show; it lives in
+    # the repo's shared stash list, so the tree is kept and says where.
+    [ "$(stash_count "$tree/$rel" "$name")" = "$(stash_at_create "$manifest" "$rel")" ] ||
+      printf 'modified\t%s/(git stash list: stashes on %s)\n' "$rel" "$name" >> "$STATUS_TMP/changes"
+    # Submodules count in full: a dirty one, or one with new commits, is work.
+    gitq -C "$tree/$rel" status --porcelain=v1 -z --untracked-files=all --ignore-submodules=none |
+      tr '\0' '\n' | awk -v rel="$rel" '
+        skip { skip = 0; next }
+        {
+          xy = substr($0, 1, 2); p = substr($0, 4)
+          if (xy ~ /^[RC]/) skip = 1
+          if (xy == "??") s = "untracked"
+          else if (xy ~ /U/ || xy == "AA" || xy == "DD") s = "conflict"
+          else if (xy ~ /D/) s = "deleted"
+          else if (xy ~ /^A/) s = "added"
+          else s = "modified"
+          print s "\t" rel "/" p
+        }' >> "$STATUS_TMP/changes" || die "$rel: git status failed"
+  done < <(manifest_repos "$manifest")
+
+  # Files git does not show: hashed only when listed new or changed since the
+  # manifest (ctime catches files moved in with old times), so this stays fast.
+  repos=$(manifest_repos "$manifest" | cut -d' ' -f3-)
+  awk '$1 == "file" { sub(/^file /, ""); print }' "$manifest" > "$STATUS_TMP/before"
+  tracked_extras "$tree" "$repos" > "$STATUS_TMP/now" || die "could not list the tree's files"
+  (cd "$tree" && find . -cnewer "$MANIFEST" \( -type f -o -type l \) -print | sed 's|^\./||') > "$STATUS_TMP/touched" ||
+    die "could not check the tree's files"
+  awk -F'\t' 'FILENAME == ARGV[1] { t[$0] = 1; next } FILENAME == ARGV[2] { was[$2] = 1; next } !($0 in was) || ($0 in t)' \
+    "$STATUS_TMP/touched" "$STATUS_TMP/before" "$STATUS_TMP/now" | hash_paths "$tree" > "$STATUS_TMP/hashed"
+  awk -F'\t' -v noise="$NOISE_RE" '
+    FILENAME == ARGV[1] { was[$2] = $1; next }
+    FILENAME == ARGV[2] { now[$0] = 1; next }
+    { h[$2] = $1 }
+    END {
+      for (p in now) if (p !~ noise) {
+        if (!(p in was)) print "added\t" p
+        else if ((p in h) && h[p] != was[p]) print "modified\t" p
+      }
+      for (p in was) if (!(p in now) && p !~ noise) print "deleted\t" p
+    }' "$STATUS_TMP/before" "$STATUS_TMP/now" "$STATUS_TMP/hashed" >> "$STATUS_TMP/changes"
+
+  printf 'revision %s\n' "$(fingerprint "$pairs")"
+  printf 'unpublished %s\n' "$unpublished"
+  LC_ALL=C sort -u "$STATUS_TMP/changes"
+}
+
+# ---------------------------------------------------------------- remove ----
+
+# What a status report in file $1 says about a tree made at revision $2:
+# clean, committed (new commits, nothing else) or changed. awk reads all of
+# it: an early-exiting `grep -q` on a pipe can kill the writer and, under
+# pipefail, read a large report as clean.
+report_state() {
+  awk -v since="$2" '
+    $1 == "revision" { moved = ($2 != since); next }
+    $1 == "unpublished" { if ($2 != "0") changed = 1; next }
+    NF > 0 { changed = 1 }
+    END { print changed ? "changed" : moved ? "committed" : "clean" }' "$1"
+}
+
+cmd_remove() {
+  local discard=0 arg="" tree manifest root name report created sha rel cur failed="" kept=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --discard) discard=1; shift ;;
+      -*) usage ;;
+      *) [ -z "$arg" ] || usage; arg=$1; shift ;;
+    esac
+  done
+  [ -n "$arg" ] || usage
+  if [ ! -e "$arg" ]; then
+    printf 'already removed\n'
+    exit 0
+  fi
+  tree=$(open_tree "$arg") || exit 1
+  manifest="$tree/$MANIFEST"
+  root=$(manifest_get "$manifest" root)
+  name=$(manifest_get "$manifest" name)
+  cd /
+
+  if [ $discard -eq 0 ]; then
+    report=$(mktemp) || die "could not make a temporary file"
+    "$SELF" status "$tree" > "$report" || { rm -f "$report"; die "could not read what $tree holds, so it is kept"; }
+    case "$(report_state "$report" "$(manifest_get "$manifest" since)")" in
+      clean) rm -f "$report" ;;
+      committed) rm -f "$report"; die "$tree has new commits; it is kept (remove --discard removes it; the commits stay on branch $name)" ;;
+      *)
+        awk 'NR > 2 && n++ < 20' "$report" >&2
+        rm -f "$report"
+        die "$tree holds work (above); it is kept (remove --discard removes it anyway)"
+        ;;
+    esac
+  fi
+
+  while read -r created sha rel; do
+    if [ -d "$tree/$rel" ]; then
+      git -C "$root/$rel" worktree remove --force "$tree/$rel" >&2 || failed="$failed $rel"
+    else
+      git -C "$root/$rel" worktree prune >&2 || true
+    fi
+  done < <(manifest_repos "$manifest")
+  [ -z "$failed" ] || die "could not remove the worktree of$failed; the tree is left in place"
+
+  while read -r created sha rel; do
+    cur=$(git -C "$root/$rel" rev-parse --verify -q "refs/heads/$name") || continue
+    if [ "$created" = 1 ] && [ "$cur" = "$sha" ]; then
+      git -C "$root/$rel" branch -D "$name" >/dev/null 2>&1 || kept="$kept, $rel"
+    else
+      kept="$kept, $rel"
+    fi
+  done < <(manifest_repos "$manifest")
+
+  safe_rm "$tree"
+  rmdir "$(dirname "$tree")" 2>/dev/null || true
+  if [ -n "$kept" ]; then printf 'kept branch %s in %s\n' "$name" "${kept#, }"; else printf 'removed\n'; fi
+}
+
+# ------------------------------------------------------------------ list ----
+
+cmd_list() {
+  local from=. root t report state
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from) [ $# -ge 2 ] || usage; from=$2; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  root=$(real_dir "$from") || die "no such folder: $from"
+  [ -f "$root/$MANIFEST" ] && root=$(manifest_get "$root/$MANIFEST" root)
+  report=$(mktemp) || die "could not make a temporary file"
+  for t in "$(dirname "$root")/$(basename "$root").trees"/*; do
+    [ -f "$t/$MANIFEST" ] || continue
+    if "$SELF" status "$t" > "$report" 2>/dev/null; then
+      state=$(report_state "$report" "$(manifest_get "$t/$MANIFEST" since)")
+    else
+      state=unknown
+    fi
+    printf '%s\t%s\t%s\n' "$(manifest_get "$t/$MANIFEST" name)" "$t" "$state"
+  done
+  rm -f "$report"
+}
+
+case "${1:-}" in
+  create) shift; cmd_create "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  list) shift; cmd_list "$@" ;;
+  *) usage ;;
+esac
