@@ -1,3 +1,5 @@
 # Written by Claude Code when it loads the mod from this folder.
 .claude-plugin/types/
 .DS_Store
+# Scratch HyperFrames project that renders the README visuals.
+.media/
